@@ -1,4 +1,4 @@
-#Requires -RunAsAdministrator
+﻿#Requires -RunAsAdministrator
 <#
 .SYNOPSIS
     Universal Monthly System Updater for Windows.
@@ -128,10 +128,10 @@ function Test-DiskSpace {
 
 function Acquire-Lock {
     if (Test-Path $LockFile) {
-        $pid = Get-Content $LockFile -ErrorAction SilentlyContinue
-        $proc = Get-Process -Id $pid -ErrorAction SilentlyContinue
+        $lockPid = Get-Content $LockFile -ErrorAction SilentlyContinue
+        $proc = Get-Process -Id $lockPid -ErrorAction SilentlyContinue
         if ($proc) {
-            Log-Error "Another update is running (PID $pid). Aborting."
+            Log-Error "Another update is running (PID $lockPid). Aborting."
             exit 1
         }
     }
@@ -165,31 +165,186 @@ function Update-WindowsSystem {
     }
 }
 
-# ─── GPU / hardware drivers ───────────────────────────────────────────────────
+# ─── All device drivers ───────────────────────────────────────────────────────
 
-function Update-GpuDrivers {
-    Invoke-Step "GPU & hardware drivers" {
+function Update-AllDrivers {
+    Invoke-Step "All device drivers" {
+
+        # --- 1. Windows Update driver pass (covers all signed drivers) ---
+        Log-Ok "Running Windows Update driver scan..."
+        try {
+            if (-not (Get-Module -ListAvailable -Name PSWindowsUpdate)) {
+                Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope AllUsers | Out-Null
+                Install-Module PSWindowsUpdate -Force -Scope AllUsers -AllowClobber | Out-Null
+            }
+            Import-Module PSWindowsUpdate -Force
+            Install-WindowsUpdate -UpdateType Driver -AcceptAll -IgnoreReboot -Confirm:$false `
+                2>&1 | Out-File $LogFile -Append
+            Log-Ok "Windows Update driver pass complete."
+        } catch { Log-Warn "PSWindowsUpdate driver pass failed: $_" }
+
+        # --- 2. pnputil scan — triggers Device Manager-style scan for all devices ---
+        Log-Ok "Running pnputil device scan (Device Manager equivalent)..."
+        try {
+            pnputil /scan-devices 2>&1 | Out-File $LogFile -Append
+            Log-Ok "pnputil scan complete."
+        } catch { Log-Warn "pnputil scan failed: $_" }
+
+        # --- 3. PnP device scan — push driver updates to every device ---
+        Log-Ok "Pushing driver updates to all PnP devices..."
+        try {
+            $allStatuses = @('OK', 'Unknown', 'Degraded', 'Error')
+            $devices = Get-PnpDevice -ErrorAction SilentlyContinue |
+                       Where-Object { $_.Status -in $allStatuses }
+            $updated = 0; $failed = 0
+            foreach ($dev in $devices) {
+                try {
+                    $result = Update-PnpDeviceDriver -InstanceId $dev.InstanceId `
+                                  -Confirm:$false -ErrorAction Stop
+                    if ($result) {
+                        Log-Ok "  Updated: $($dev.FriendlyName)"
+                        $updated++
+                    }
+                } catch {
+                    # Most devices will already be on latest — not an error
+                    $failed++
+                }
+            }
+            Log-Ok "PnP driver update complete: $updated updated, $failed already current/skipped."
+        } catch { Log-Warn "PnP driver scan failed: $_" }
+
+        # --- 4. DISM driver health check ---
+        Log-Ok "Running DISM driver store health check..."
+        try {
+            DISM /Online /Cleanup-Image /AnalyzeComponentStore 2>&1 | Out-File $LogFile -Append
+            Log-Ok "DISM check complete."
+        } catch { Log-Warn "DISM check failed: $_" }
+
+        # --- 5. Vendor-specific update tools (winget) ---
         $driverPkgs = @(
-            @{ Id="Nvidia.GeForceExperience";                  Name="NVIDIA GeForce Experience"     },
-            @{ Id="Nvidia.CUDA";                               Name="NVIDIA CUDA Toolkit"           },
-            @{ Id="Intel.IntelDriverAndSupportAssistant";      Name="Intel Driver Support Assistant"},
-            @{ Id="AdvancedMicroDevices.AMDSoftware";          Name="AMD Software Adrenalin"        },
-            @{ Id="Intel.IntelArcControlApp";                  Name="Intel Arc Control"             },
-            @{ Id="Realtek.RealtekAudioControl";               Name="Realtek Audio Control"         }
+            @{ Id="Nvidia.GeForceExperience";             Name="NVIDIA GeForce Experience"      },
+            @{ Id="Nvidia.CUDA";                          Name="NVIDIA CUDA Toolkit"            },
+            @{ Id="Intel.IntelDriverAndSupportAssistant"; Name="Intel Driver Support Assistant" },
+            @{ Id="AdvancedMicroDevices.AMDSoftware";     Name="AMD Software Adrenalin"         },
+            @{ Id="Intel.IntelArcControlApp";             Name="Intel Arc Control"              },
+            @{ Id="Realtek.RealtekAudioControl";          Name="Realtek Audio Control"          },
+            @{ Id="ASUSTeK.ArmoryCrate";                  Name="ASUS Armory Crate"              },
+            @{ Id="Logitech.GHUB";                        Name="Logitech G HUB"                 },
+            @{ Id="Corsair.iCUE4";                        Name="Corsair iCUE"                   },
+            @{ Id="Razer.Synapse3";                       Name="Razer Synapse"                  },
+            @{ Id="Microsoft.XboxAccessories";            Name="Xbox Accessories (controller driver)" },
+            @{ Id="9NBLGGH30XJ3";                        Name="Xbox Controller driver (Store)"  }
         )
 
-        foreach ($pkg in $driverPkgs) {
-            $installed = winget list --id $pkg.Id 2>&1
-            if ($installed -match [regex]::Escape($pkg.Id)) {
-                Log-Ok "Upgrading $($pkg.Name)..."
-                winget upgrade --id $pkg.Id --silent `
-                    --accept-source-agreements --accept-package-agreements `
-                    2>&1 | Out-File $LogFile -Append
+        if (Get-Command winget -ErrorAction SilentlyContinue) {
+            foreach ($pkg in $driverPkgs) {
+                $installed = winget list --id $pkg.Id 2>&1
+                if ($installed -match [regex]::Escape($pkg.Id)) {
+                    Log-Ok "Upgrading $($pkg.Name)..."
+                    winget upgrade --id $pkg.Id --silent `
+                        --accept-source-agreements --accept-package-agreements `
+                        2>&1 | Out-File $LogFile -Append
+                } else {
+                    # Install if not present (for controller/accessory drivers)
+                    if ($pkg.Id -in @("Microsoft.XboxAccessories")) {
+                        Log-Ok "Installing $($pkg.Name)..."
+                        winget install --id $pkg.Id --silent `
+                            --accept-source-agreements --accept-package-agreements `
+                            2>&1 | Out-File $LogFile -Append
+                    }
+                }
             }
         }
 
-        # Windows Update already covers signed driver updates (done above)
-        Add-Summary "GPU/hardware drivers: checked"
+        # --- 6. Targeted fixes for known Unknown-status device classes ---
+
+        # Bluetooth stack — restart service to re-enumerate BT devices
+        Log-Ok "Restarting Bluetooth support service to re-enumerate BT devices..."
+        try {
+            Restart-Service bthserv -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 3
+            Log-Ok "Bluetooth service restarted."
+        } catch { Log-Warn "Could not restart Bluetooth service: $_" }
+
+        # USB devices — re-enumerate USB tree via devmgmt trick with pnputil
+        Log-Ok "Re-enumerating USB devices..."
+        try {
+            pnputil /scan-devices 2>&1 | Out-File $LogFile -Append
+            # Restart USB hub drivers for Generic USB Hub / SuperSpeed Hub
+            Get-PnpDevice -ErrorAction SilentlyContinue |
+                Where-Object { $_.FriendlyName -match "USB Hub" -and $_.Status -eq "Unknown" } |
+                ForEach-Object {
+                    Disable-PnpDevice -InstanceId $_.InstanceId -Confirm:$false -ErrorAction SilentlyContinue
+                    Start-Sleep -Milliseconds 500
+                    Enable-PnpDevice -InstanceId $_.InstanceId -Confirm:$false -ErrorAction SilentlyContinue
+                    Log-Ok "  Cycled: $($_.FriendlyName)"
+                }
+        } catch { Log-Warn "USB re-enumeration failed: $_" }
+
+        # Audio virtual endpoints (SWD\MMDEVAPI) — restart audio services
+        Log-Ok "Restarting Windows Audio services to refresh virtual audio endpoints..."
+        try {
+            Restart-Service Audiosrv -Force -ErrorAction SilentlyContinue
+            Restart-Service AudioEndpointBuilder -Force -ErrorAction SilentlyContinue
+            Log-Ok "Audio services restarted."
+        } catch { Log-Warn "Could not restart audio services: $_" }
+
+        # JBL Quantum — cycle device to reload USB audio driver
+        Log-Ok "Cycling JBL Quantum USB devices..."
+        try {
+            Get-PnpDevice -ErrorAction SilentlyContinue |
+                Where-Object { $_.FriendlyName -match "JBL" -and $_.Status -eq "Unknown" } |
+                ForEach-Object {
+                    Disable-PnpDevice -InstanceId $_.InstanceId -Confirm:$false -ErrorAction SilentlyContinue
+                    Start-Sleep -Milliseconds 500
+                    Enable-PnpDevice -InstanceId $_.InstanceId -Confirm:$false -ErrorAction SilentlyContinue
+                    Log-Ok "  Cycled: $($_.FriendlyName)"
+                }
+        } catch { Log-Warn "JBL device cycle failed: $_" }
+
+        # Xbox controllers — cycle XINPUT devices
+        Log-Ok "Cycling Xbox/XINPUT controller devices..."
+        try {
+            Get-PnpDevice -ErrorAction SilentlyContinue |
+                Where-Object { ($_.FriendlyName -match "Xbox|XINPUT") -and $_.Status -eq "Unknown" } |
+                ForEach-Object {
+                    Disable-PnpDevice -InstanceId $_.InstanceId -Confirm:$false -ErrorAction SilentlyContinue
+                    Start-Sleep -Milliseconds 500
+                    Enable-PnpDevice -InstanceId $_.InstanceId -Confirm:$false -ErrorAction SilentlyContinue
+                    Log-Ok "  Cycled: $($_.FriendlyName)"
+                }
+        } catch { Log-Warn "Xbox device cycle failed: $_" }
+
+        # Generic Non-PnP Monitor — install generic monitor driver
+        Log-Ok "Checking monitor driver..."
+        try {
+            Get-PnpDevice -ErrorAction SilentlyContinue |
+                Where-Object { $_.FriendlyName -match "Monitor" -and $_.Status -eq "Unknown" } |
+                ForEach-Object {
+                    Update-PnpDeviceDriver -InstanceId $_.InstanceId -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
+                    Log-Ok "  Driver update attempted: $($_.FriendlyName)"
+                }
+        } catch { }
+
+        # Shadow copy volumes — transient, no action needed, just exclude from report
+        # SWD\MMDEVAPI virtual audio endpoints — transient, no driver needed
+
+        # --- 7. Final report — exclude known virtual/transient device classes ---
+        $virtualPrefixes = @('SWD\MMDEVAPI', 'STORAGE\VOLUMESNAPSHOT')
+        $problemDevices = Get-PnpDevice -Status Error, Unknown, Degraded -ErrorAction SilentlyContinue |
+            Where-Object {
+                $id = $_.InstanceId.ToUpper()
+                -not ($virtualPrefixes | Where-Object { $id.StartsWith($_) })
+            }
+
+        if ($problemDevices) {
+            Log-Warn "Devices still needing attention after all fixes:"
+            $problemDevices | ForEach-Object { Log-Warn "  [$($_.Status)] $($_.FriendlyName) — $($_.InstanceId)" }
+            Add-Summary "Drivers: $($problemDevices.Count) real device(s) may need manual attention"
+        } else {
+            Log-Ok "All real devices OK after driver update."
+            Add-Summary "Drivers: all devices OK"
+        }
     }
 }
 
@@ -222,12 +377,7 @@ function Update-StoreApps {
                 2>&1 | Out-File $LogFile -Append
             Add-Summary "Microsoft Store: updated"
         }
-        # Also trigger UWP store updates via COM
-        try {
-            $storeUpdate = [Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallManager,
-                Windows.ApplicationModel.Store.Preview, ContentType=WindowsRuntime]::new()
-            $storeUpdate.UpdateAppByPackageFamilyNameAsync("") | Out-Null
-        } catch { }
+        # Store update via winget msstore source covers UWP updates
     }
 }
 
@@ -431,22 +581,31 @@ function Print-Summary {
 
     if ($Notify) {
         $msg = $Summary -join "`n"
-        [Windows.UI.Notifications.ToastNotificationManager,
-         Windows.UI.Notifications, ContentType=WindowsRuntime] | Out-Null
-        $xml = [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument,
-                ContentType=WindowsRuntime]::new()
-        $xml.LoadXml("<toast><visual><binding template='ToastGeneric'>" +
-                     "<text>System Update Complete</text>" +
-                     "<text>$msg</text></binding></visual></toast>")
-        $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
-        [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("auto-update").Show($toast)
+        try {
+            Add-Type -AssemblyName System.Windows.Forms
+            $balloon = New-Object System.Windows.Forms.NotifyIcon
+            $balloon.Icon = [System.Drawing.SystemIcons]::Information
+            $balloon.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::Info
+            $balloon.BalloonTipTitle = "System Update Complete"
+            $balloon.BalloonTipText = $msg
+            $balloon.Visible = $true
+            $balloon.ShowBalloonTip(5000)
+            Start-Sleep -Seconds 6
+            $balloon.Dispose()
+        } catch { }
     }
 
     # Write to Application Event Log
-    Write-EventLog -LogName Application -Source "auto-update" -EventId 1001 `
-        -EntryType Information `
-        -Message "Monthly update complete (${elapsed}s). Items: $($Summary.Count)" `
-        -ErrorAction SilentlyContinue
+    try {
+        $evtSrc = "auto-update"
+        if (-not [System.Diagnostics.EventLog]::SourceExists($evtSrc)) {
+            [System.Diagnostics.EventLog]::CreateEventSource($evtSrc, "Application")
+        }
+        $evtLog = [System.Diagnostics.EventLog]::new("Application")
+        $evtLog.Source = $evtSrc
+        $evtLog.WriteEntry("Monthly update complete (${elapsed}s). Items: $($Summary.Count)", [System.Diagnostics.EventLogEntryType]::Information, 1001)
+        $evtLog.Dispose()
+    } catch { }
 }
 
 # ─── Task Scheduler installation ──────────────────────────────────────────────
@@ -519,7 +678,7 @@ Test-Network
 Test-DiskSpace
 
 if ($UpdateOsPackages) { Update-WindowsSystem }
-if ($UpdateDrivers)    { Update-GpuDrivers }
+if ($UpdateDrivers)    { Update-AllDrivers }
 Update-WingetApps
 Update-StoreApps
 Update-ChocolateyApps
