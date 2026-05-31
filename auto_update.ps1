@@ -167,8 +167,34 @@ function Update-WindowsSystem {
 
 # ─── All device drivers ───────────────────────────────────────────────────────
 
+function Remove-OldDrivers {
+    Log-Ok "Cleaning up old/superseded drivers from driver store..."
+    try {
+        # Remove all superseded third-party drivers via pnputil
+        $removed = 0
+        $oemDrivers = pnputil /enum-drivers 2>&1 | Select-String "oem\d+\.inf" | ForEach-Object {
+            ($_ -match "(oem\d+\.inf)") | Out-Null; $matches[1]
+        }
+        foreach ($inf in $oemDrivers) {
+            $result = pnputil /delete-driver $inf 2>&1
+            if ($result -match "deleted") { $removed++; Log-Ok "  Removed old driver: $inf" }
+        }
+        Log-Ok "Old driver cleanup: $removed superseded driver(s) removed."
+    } catch { Log-Warn "Driver store cleanup failed: $_" }
+
+    # Run DISM component store cleanup to reclaim space from old driver packages
+    try {
+        Log-Ok "Running DISM component store cleanup..."
+        DISM /Online /Cleanup-Image /StartComponentCleanup /ResetBase 2>&1 | Out-File $LogFile -Append
+        Log-Ok "DISM cleanup complete."
+    } catch { Log-Warn "DISM cleanup failed: $_" }
+}
+
 function Update-AllDrivers {
     Invoke-Step "All device drivers" {
+
+        # --- 0. Clean out old/superseded drivers first ---
+        Remove-OldDrivers
 
         # --- 1. Windows Update driver pass (covers all signed drivers) ---
         Log-Ok "Running Windows Update driver scan..."
