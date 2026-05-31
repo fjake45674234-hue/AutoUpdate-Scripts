@@ -15,9 +15,27 @@ Drop these scripts on any machine, run the installer once, and the system will u
 
 ---
 
+## Requirements
+
+### Windows
+- **PowerShell 7** (`pwsh`) — required. Install via:
+  ```powershell
+  winget install Microsoft.PowerShell --accept-package-agreements --accept-source-agreements
+  ```
+- **Administrator privileges** — the script must be run elevated
+- `PSWindowsUpdate` module — installed automatically on first run
+
+### Linux · macOS · BSD
+- Bash 4+
+- Root / sudo access
+- `cron` or `cronie` — installed automatically if missing
+
+---
+
 ## What gets updated
 
 ### Operating system packages
+
 | Platform | Tool used |
 |---|---|
 | Debian · Ubuntu · Kali · Mint | `apt-get` |
@@ -34,10 +52,25 @@ Drop these scripts on any machine, run the installer once, and the system will u
 | macOS | `softwareupdate` |
 | Windows | Windows Update via `PSWindowsUpdate` |
 
-### Drivers & firmware
+### Drivers & firmware (Windows)
+
+Full 7-step driver update covering every device in Device Manager:
+
+| Step | What it does |
+|---|---|
+| Windows Update driver pass | Installs all Microsoft-signed drivers via PSWindowsUpdate |
+| `pnputil /scan-devices` | Device Manager-style scan — detects new/changed hardware |
+| PnP device loop | Iterates every device and pushes the latest available driver |
+| DISM health check | Audits the driver store for corruption |
+| Vendor tools (winget) | NVIDIA · AMD · Intel · Realtek · Logitech · Corsair · Razer · Xbox Accessories |
+| Device cycling | JBL · Xbox/XINPUT · USB hubs — disable/enable cycle to reload drivers |
+| Service restarts | Bluetooth (`bthserv`) · Windows Audio (`Audiosrv`, `AudioEndpointBuilder`) |
+
+Virtual/transient devices (audio endpoints `SWD\MMDEVAPI`, shadow copies `STORAGE\VOLUMESNAPSHOT`) are automatically excluded from the problem report.
+
+### Drivers & firmware (Linux · macOS)
 - **Linux** — `fwupdmgr` (firmware), `ubuntu-drivers`, DKMS module rebuilds
 - **macOS** — included in `softwareupdate`
-- **Windows** — Windows Update (signed drivers) + NVIDIA / AMD / Intel GPU drivers via `winget`
 
 ### Application stores & package managers
 `Homebrew` · `Snap` · `Flatpak` · `winget` · `Chocolatey` · `Scoop` · Microsoft Store
@@ -57,6 +90,41 @@ Metasploit (`msfupdate`) · sqlmap · Nuclei templates · searchsploit / exploit
 ---
 
 ## Installation & usage
+
+### Windows
+
+> **Requires PowerShell 7 (`pwsh`) and Administrator privileges.**
+
+**1. Copy `auto_update.ps1` to the target machine.**
+
+**2. Open PowerShell 7 as Administrator, then run:**
+
+```powershell
+# Install monthly Task Scheduler job (runs 1st of month at 03:00 as SYSTEM)
+pwsh -ExecutionPolicy Bypass -File auto_update.ps1 -Install
+
+# Run an update immediately
+pwsh -ExecutionPolicy Bypass -File auto_update.ps1
+
+# Preview without making changes
+pwsh -ExecutionPolicy Bypass -File auto_update.ps1 -DryRun
+
+# Run with desktop notification on completion
+pwsh -ExecutionPolicy Bypass -File auto_update.ps1 -Notify
+```
+
+The installer will:
+- Register a Task Scheduler job that runs as SYSTEM on the 1st of each month at 03:00
+- Auto-install the `PSWindowsUpdate` module if needed
+- Log everything to `C:\Windows\Logs\auto-update.log`
+
+**3. To remove the scheduled task:**
+
+```powershell
+Unregister-ScheduledTask -TaskName "MonthlySystemUpdate" -Confirm:$false
+```
+
+---
 
 ### Linux · macOS · FreeBSD · OpenBSD · NetBSD
 
@@ -96,36 +164,6 @@ sudo /usr/local/sbin/auto-update --notify
 
 ---
 
-### Windows
-
-**1. Copy `auto_update.ps1` to the target machine.**
-
-**2. Open PowerShell as Administrator, then run:**
-
-```powershell
-# Install monthly Task Scheduler job (runs 1st of month at 03:00)
-powershell -ExecutionPolicy Bypass -File auto_update.ps1 -Install
-
-# Run an update immediately
-powershell -ExecutionPolicy Bypass -File auto_update.ps1
-
-# Preview without making changes
-powershell -ExecutionPolicy Bypass -File auto_update.ps1 -DryRun
-```
-
-The installer will:
-- Register a Task Scheduler job that runs as SYSTEM on the 1st of each month at 03:00
-- Auto-install the `PSWindowsUpdate` PowerShell module if needed
-- Log everything to `C:\Windows\Logs\auto-update.log`
-
-**3. To remove the scheduled task:**
-
-```powershell
-Unregister-ScheduledTask -TaskName "MonthlySystemUpdate" -Confirm:$false
-```
-
----
-
 ## Logs
 
 | Platform | Log location |
@@ -138,7 +176,12 @@ Unregister-ScheduledTask -TaskName "MonthlySystemUpdate" -Confirm:$false
 tail -f /var/log/auto-update.log
 ```
 
-Logs rotate automatically when they exceed 10 MB.
+```powershell
+# Live log tail (Windows)
+Get-Content "C:\Windows\Logs\auto-update.log" -Wait -Tail 20
+```
+
+Logs rotate automatically when they exceed 10 MB. Windows completion is also written to the Application Event Log (Event ID 1001, Source: `auto-update`).
 
 ---
 
@@ -147,7 +190,7 @@ Logs rotate automatically when they exceed 10 MB.
 The scripts **never reboot automatically**. If a reboot is required after an update:
 
 - **Linux/BSD** — a flag file is created at `/var/run/auto-update-reboot-required` and a message is written to the log
-- **Windows** — a message is written to the log and the Windows Application Event Log
+- **Windows** — a warning is written to the log and the Application Event Log
 
 Check for a pending reboot:
 
@@ -167,18 +210,37 @@ Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Up
 
 | Feature | Detail |
 |---|---|
-| Lock file | Prevents two update runs from overlapping |
+| Lock file | Prevents two update runs from overlapping (`%TEMP%\auto-update.lock`) |
 | Network check | Aborts if there is no internet connectivity |
 | Disk space check | Aborts if less than 500 MB free |
-| Dry-run mode | `--dry-run` / `-DryRun` shows what would run without changing anything |
+| Dry-run mode | `--dry-run` / `-DryRun` — shows what would run without changing anything |
 | Log rotation | Log files are rotated at 10 MB |
 | No forced reboots | Reboot requirement is logged only — never triggered automatically |
+| Event log | Windows: completion written to Application Event Log (Event ID 1001) |
 
 ---
 
-## Customisation (Linux/macOS)
+## Customisation
 
-Create `/etc/auto-update.conf` to enable or disable sections:
+### Windows — feature flags (top of `auto_update.ps1`)
+
+```powershell
+$UpdateOsPackages  = $true   # Windows Update patches
+$UpdateDrivers     = $true   # Full device driver update (all 7 steps)
+$UpdateWinget      = $true   # winget app upgrades
+$UpdateChocolatey  = $true   # Chocolatey packages
+$UpdateScoop       = $true   # Scoop packages
+$UpdateStore       = $true   # Microsoft Store apps
+$UpdateAppManagers = $true   # pip · npm · gem · rustup · conda · etc.
+$UpdateContainers  = $true   # Docker image pulls
+$UpdateDevTools    = $true   # VS Code · Neovim · Git for Windows
+```
+
+Set any value to `$false` to skip that section.
+
+### Linux/macOS — config file
+
+Create `/etc/auto-update.conf`:
 
 ```bash
 UPDATE_OS_PACKAGES=true
@@ -191,4 +253,15 @@ UPDATE_PLUGINS=true
 UPDATE_SECURITY_TOOLS=true
 ```
 
-Set any value to `false` to skip that section.
+---
+
+## Troubleshooting (Windows)
+
+| Error | Fix |
+|---|---|
+| `#Requires -RunAsAdministrator` | Run PowerShell 7 as Administrator |
+| `pwsh: command not found` | Install PS7: `winget install Microsoft.PowerShell` |
+| `Another update is running` | Delete `%TEMP%\auto-update.lock` and retry |
+| `PSWindowsUpdate` errors | Run `Install-Module PSWindowsUpdate -Force -Scope AllUsers` manually |
+| Devices still Unknown after update | Reboot — shadow copies and virtual audio endpoints clear on restart |
+| `Write-EventLog not recognized` | Ensure you are using PowerShell 7 (`pwsh`), not PowerShell 5 (`powershell`) |

@@ -5,6 +5,10 @@
 # ║  Run this once on each machine; it handles everything else.     ║
 # ╚══════════════════════════════════════════════════════════════════╝
 #
+# Platforms: Linux · macOS · FreeBSD · OpenBSD · NetBSD
+# Windows  : use auto_update.ps1 instead (requires PowerShell 7 + admin)
+#            pwsh -ExecutionPolicy Bypass -File auto_update.ps1 -Install
+#
 # Usage:
 #   sudo bash init.sh               # install and run first update
 #   sudo bash init.sh --no-update   # install schedule only, skip first run
